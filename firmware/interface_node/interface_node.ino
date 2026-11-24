@@ -103,7 +103,8 @@ constexpr uint8_t LED_DOWN  = 1 << 3;
 
 // ==================================================
 
-constexpr uint32_t FEEDBACK_STEP_MS = 100;
+constexpr uint32_t FEEDBACK_STEP_MS = 200;
+constexpr uint32_t MODE_FEEDBACK_DURATION_MS = 2400;
 constexpr uint32_t DEBOUNCE_MS = 50;
 constexpr uint32_t LINK_TIMEOUT_MS = 300;
 const uint8_t EXPECTED_NODE_A[6] = {}; // Or enter the station MAC of your belt.
@@ -292,7 +293,7 @@ bool showModeFeedback() {
 
   // MODE 1: all four LEDs flash twice.
   if (feedbackMode == 1) {
-    if (elapsed >= 4 * FEEDBACK_STEP_MS) {
+    if (elapsed >= MODE_FEEDBACK_DURATION_MS) {
       feedbackMode = 0;
       return false;
     }
@@ -306,12 +307,12 @@ bool showModeFeedback() {
 
   // MODE 2: LED1 -> LED2 -> LED3 -> LED4.
   if (feedbackMode == 2) {
-    if (elapsed >= 4 * FEEDBACK_STEP_MS) {
+    if (elapsed >= MODE_FEEDBACK_DURATION_MS){
       feedbackMode = 0;
       return false;
     }
 
-    uint8_t step = elapsed / FEEDBACK_STEP_MS;
+    uint8_t step = (elapsed / FEEDBACK_STEP_MS) % 4;
 
     setLedMask(1 << step);
     return true;

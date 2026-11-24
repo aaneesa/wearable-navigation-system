@@ -20,7 +20,8 @@
 
   MODE 2:
     LEDs chase from LED1 to LED4 on selection.
-    Afterwards one LED shows FORWARD, LEFT, RIGHT or HOLD.
+    A blinking direction means FORWARD or turn in place and rescan.
+    Steady DOWN means all movement directions have confirmed obstructions.
 
   Sensor order in Node A:
     LEFT=0, CENTER=1, RIGHT=2, UP=3, DOWN=4
@@ -53,7 +54,8 @@ enum Reason {
   CALIBRATE,
   CHECK_GROUND,
   NO_PATH,
-  PATH_FOUND
+  PATH_FOUND,
+  WAIT_FOR_ECHO
 };
 
 struct __attribute__((packed)) NavPacket {
@@ -64,13 +66,14 @@ struct __attribute__((packed)) NavPacket {
   uint8_t recommendedLed;
   uint8_t reason;
   uint8_t obstacleMask;
-  uint8_t clearMask;
+  uint8_t clearMask;       // Confirmed Mode 2 clearance or normal floor.
+  uint8_t blockedMask;     // Positive obstacle evidence for Mode 2.
   uint16_t lifeMs[N];
 };
 
-static_assert(sizeof(NavPacket) == 25, "Packet layout mismatch");
+static_assert(sizeof(NavPacket) == 26, "Packet layout mismatch");
 constexpr uint16_t MAGIC = 0x4E56;
-constexpr uint8_t VERSION = 2;
+constexpr uint8_t VERSION = 3;
 constexpr uint8_t WIFI_CHANNEL = 1;
 constexpr uint16_t FRESH_MS = 450;
 
@@ -235,13 +238,13 @@ void Receiver::receive(const esp_now_recv_info_t *info, const uint8_t *data, int
   if (packet.magic != MAGIC || packet.version != VERSION || !packet.boot) {
     return;
   }
-  if (packet.recommendedLed > TURN_RIGHT || packet.reason > PATH_FOUND) {
+  if (packet.recommendedLed > TURN_RIGHT || packet.reason > WAIT_FOR_ECHO) {
     return;
   }
-  if ((packet.clearMask | packet.obstacleMask) & 0xE0) {
+  if ((packet.clearMask | packet.obstacleMask | packet.blockedMask) & 0xE0) {
     return;
   }
-  if (packet.clearMask & packet.obstacleMask) {
+  if (packet.clearMask & (packet.obstacleMask | packet.blockedMask)) {
     return;
   }
   for (int i = 0; i < N; i++) {
@@ -371,7 +374,9 @@ Display Renderer::chooseDisplay(uint8_t mode, const Received &message, bool conn
     }
   }
   result.freshMask = fresh;
+  result.reason = packet.reason;
   if (!fresh) {
+    result.reason = WAIT_FOR_ECHO;
     result.view = UNKNOWN;
     return result;
   }
@@ -381,27 +386,27 @@ Display Renderer::chooseDisplay(uint8_t mode, const Received &message, bool conn
     return result;
   }
 
-  // HOLD is the starting decision. Replace it only when the required
-  // beams still support the movement instruction received from Node A.
-  result.view = PAUSE;
-  result.leds = LED_DOWN;
+  // Missing evidence gets a double flash. Steady DOWN requires fresh
+  // positive evidence that forward, left and right are all blocked.
+  result.view = UNKNOWN;
   result.reason = packet.reason;
   uint8_t clear = packet.clearMask & fresh;
-  if (packet.reason == CALIBRATE) {
-    return result;
-  }
-  if (!(clear & sensorBit(DOWN))) {
-    result.reason = CHECK_GROUND;
+  uint8_t blocked = packet.blockedMask & fresh;
+  bool frontBlocked = blocked & (sensorBit(CENTER) | sensorBit(UP) | sensorBit(DOWN));
+  if (packet.reason == NO_PATH && frontBlocked &&
+      (blocked & sensorBit(LEFT)) && (blocked & sensorBit(RIGHT))) {
+    result.view = PAUSE;
+    result.leds = LED_DOWN;
     return result;
   }
   if (packet.reason != PATH_FOUND) {
+    if (packet.reason == NO_PATH) result.reason = WAIT_FOR_ECHO;
     return result;
   }
-
   uint8_t needed = 0;
   switch (packet.recommendedLed) {
     case FORWARD:
-      needed = sensorBit(CENTER) | sensorBit(UP);
+      needed = sensorBit(CENTER) | sensorBit(UP) | sensorBit(DOWN);
       break;
     case TURN_LEFT:
       needed = sensorBit(LEFT);
@@ -412,7 +417,7 @@ Display Renderer::chooseDisplay(uint8_t mode, const Received &message, bool conn
     default: return result;
   }
   if ((clear & needed) != needed) {
-    result.reason = NO_PATH;
+    result.reason = WAIT_FOR_ECHO;
     return result;
   }
   result.view = GUIDANCE;
@@ -463,7 +468,7 @@ void Renderer::updateLEDs() {
   static uint8_t previousMask = 0;
   uint32_t now = millis();
   Display current = renderer.chooseDisplay(selectedMode, latest, receivedPacket, now);
-  if (current.view != previousView || (!previousMask && current.leds)) {
+  if (current.view != previousView || (current.leds && previousMask != current.leds)) {
     patternStart = now;
   }
   previousView = current.view;
@@ -493,7 +498,7 @@ void Renderer::updateLEDs() {
   if (showModeFeedback()) {
     return;
   }
-  if (current.view == OBSTACLES && phase % 500 >= 300) {
+  if ((current.view == OBSTACLES || current.view == GUIDANCE) && phase % 500 >= 300) {
     allLedsOff();
   }
   else {
@@ -508,15 +513,15 @@ void printDebug() {
     return;
   }
   const Display &current = report.display;
-  const char *views[] = {"LINK LOST","NO SENSOR DATA","OBSTACLES","GUIDANCE","HOLD"};
-  const char *reasons[] = {"calibrate floor on A","ground uncertain","no confirmed path","path available"};
+  const char *views[] = {"LINK LOST","WAIT / SENSOR UNCERTAIN","OBSTACLES","GUIDANCE","HOLD"};
+  const char *reasons[] = {"calibrate floor on A","ground uncertain","all paths blocked","path available","waiting for clear echoes"};
   Serial.printf("B | mode %u | %s | LED mask %u | seq %lu\n", report.mode,
                 views[current.view], current.leds, (unsigned long)report.sequence);
   Serial.printf("Fresh sensor mask: 0x%02X\n", current.freshMask);
   if (report.received) {
     Serial.printf("Accepted packet age: %lu ms\n", (unsigned long)(millis() - report.receivedAt));
   }
-  if (current.view == PAUSE) {
+  if (current.view == PAUSE || current.view == UNKNOWN) {
     Serial.println(reasons[current.reason]);
   }
 }

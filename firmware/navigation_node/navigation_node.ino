@@ -46,7 +46,8 @@ enum Reason {
   CALIBRATE,
   CHECK_GROUND,
   NO_PATH,
-  PATH_FOUND
+  PATH_FOUND,
+  WAIT_FOR_ECHO
 };
 
 struct __attribute__((packed)) NavPacket {
@@ -57,13 +58,14 @@ struct __attribute__((packed)) NavPacket {
   uint8_t recommendedLed;
   uint8_t reason;
   uint8_t obstacleMask;
-  uint8_t clearMask;
+  uint8_t clearMask;       // Confirmed Mode 2 clearance or normal floor.
+  uint8_t blockedMask;     // Positive obstacle evidence for Mode 2.
   uint16_t lifeMs[N];
 };
 
-static_assert(sizeof(NavPacket) == 25, "Packet layout mismatch");
+static_assert(sizeof(NavPacket) == 26, "Packet layout mismatch");
 constexpr uint16_t MAGIC = 0x4E56;
-constexpr uint8_t VERSION = 2;
+constexpr uint8_t VERSION = 3;
 constexpr uint8_t WIFI_CHANNEL = 1;
 constexpr uint16_t FRESH_MS = 450;
 
@@ -80,6 +82,11 @@ const uint8_t PEER_MAC[6] = {255,255,255,255,255,255};
 const char *const SENSOR_NAMES[N] = {"LEFT","CENTER","RIGHT","UP","DOWN"};
 const int ENTER_CM = 90;
 const int EXIT_CM = 110;
+const int PATH_RANGE_CM = 150;
+const int DOWN_RAISED_CM = 8;       // Shorter than the worn floor reference.
+const int DOWN_LONG_MARGIN_CM = 18; // Longer returns need a ground recheck.
+const int UNCALIBRATED_NEAR_CM = 35;
+const int ECHO_TIMEOUT_MS = 25;
 const int SENSOR_GAP_MS = 55;
 
 struct Reading {
@@ -95,6 +102,8 @@ struct Beam {
   int clearCount = 0;
   bool clear = false;
   bool obstacle = false;
+  bool pathBlocked = false;
+  int pathClearCount = 0;
 };
 
 struct Snapshot {
@@ -171,7 +180,7 @@ void ARDUINO_ISR_ATTR echoEdge(void *argument) {
   bool done = false;
 
   portENTER_CRITICAL_ISR(&echoLock);
-  if (pin == activePin && now - armedUs <= 16000) {
+  if (pin == activePin && now - armedUs <= ECHO_TIMEOUT_MS * 1000U) {
     if (gpio_get_level(gpio_num_t(pin))) {
       if (!risingSeen) {
         riseUs = now;
@@ -213,7 +222,7 @@ int measure(int sensor) {
   digitalWrite(TRIG_PINS[sensor], HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PINS[sensor], LOW);
-  xSemaphoreTake(echoDone, pdMS_TO_TICKS(16) + 1);
+  xSemaphoreTake(echoDone, pdMS_TO_TICKS(ECHO_TIMEOUT_MS) + 1);
 
   portENTER_CRITICAL(&echoLock);
   activePin = -1;
@@ -226,8 +235,8 @@ int measure(int sensor) {
   if (duration < 175) {
     return -2;      // Below usable range.
   }
-  if (duration > 14577) {
-    return -3;    // Above 250 cm.
+  if (duration > 23324) {
+    return -3;    // Above 400 cm.
   }
   // Round-trip time to one-way distance, rounded to whole centimetres.
   return (duration * 343U + 10000U) / 20000U;
@@ -294,7 +303,7 @@ void Navigation::processReading(const Reading &reading) {
   if (reading.at - state.at >= FRESH_MS) {
     state = Beam{};
   }
-  bool wasClear = state.clear;
+  bool wasClear = state.clearCount >= 2;
   state.cm = reading.cm;
   state.at = reading.at;
 
@@ -303,49 +312,81 @@ void Navigation::processReading(const Reading &reading) {
     return;
   }
 
-  bool near = reading.cm < ENTER_CM;
-  bool far = reading.cm > EXIT_CM;
-  if (i == DOWN) {
-    near = reading.cm < floorCm - 18;
-    far = abs(reading.cm - floorCm) <= 18;
-  }
-
-  if (reading.cm < 0 || (i == DOWN && (!floorCm || (!near && !far)))) {
+  if (reading.cm < 0) {
     state.clear = false;
     state.obstacle = false;
+    state.pathBlocked = false;
     state.clearCount = 0;
+    state.pathClearCount = 0;
     return;
   }
 
-  if (near) {
-    bool possibleLimb = i == DOWN || reading.cm <= personalBand[i];
+  if (i == DOWN) {
+    // A short DOWN echo is useful to Mode 1 even before floor calibration.
+    // Without a reference, only flag clearly close returns.
+    if (floorCm == 0) {
+      state.obstacle = reading.cm <= UNCALIBRATED_NEAR_CM;
+      state.pathBlocked = state.obstacle;
+      state.clear = false;
+      state.clearCount = 0;
+      return;
+    }
+
+    state.pathBlocked = reading.cm <= floorCm - DOWN_RAISED_CM;
+    if (state.pathBlocked) {
+      state.obstacle = true;
+      state.clear = false;
+      state.clearCount = 0;
+      return;
+    }
+
+    if (reading.cm > floorCm + DOWN_LONG_MARGIN_CM) {
+      // The floor may have fallen away, or the belt may have tilted.
+      state.clear = false;
+      state.obstacle = false;
+      state.clearCount = 0;
+      return;
+    }
+
+    if (state.clearCount < 2) state.clearCount++;
+    if (state.clearCount == 2) {
+      state.obstacle = false;
+      state.clear = true;
+    }
+    return;
+  }
+
+  // Mode 2 uses an independent 1.5 m threshold. Two fresh echoes at or
+  // beyond this distance qualify. One closer echo withdraws clearance.
+  state.pathBlocked = reading.cm < PATH_RANGE_CM;
+  if (state.pathBlocked) {
+    state.pathClearCount = 0;
+    state.clear = false;
+  } else {
+    if (state.pathClearCount < 2) state.pathClearCount++;
+    state.clear = state.pathClearCount == 2;
+  }
+
+  // Preserve Mode 1's existing obstacle distances and side limb filter.
+  if (reading.cm < ENTER_CM) {
+    bool possibleLimb = reading.cm <= personalBand[i];
     bool centerAlsoBlocked = beam[CENTER].obstacle &&
                              reading.at - beam[CENTER].at < FRESH_MS;
-    // Defer one nuisance blink only after established clearance.
     state.obstacle = !(possibleLimb && wasClear && !centerAlsoBlocked);
-    state.clear = false;
     state.clearCount = 0;
-  } else if (far) {
-    if (state.clearCount < 2) {
-      state.clearCount++;
-    }
-    if (state.clearCount == 2) {
-      state.clear = true;
-      state.obstacle = false;
-    }
+  } else if (reading.cm > EXIT_CM) {
+    if (state.clearCount < 2) state.clearCount++;
+    if (state.clearCount == 2) state.obstacle = false;
   } else {
     state.clearCount = 0;
   }
 }
 
 // ================= MODE 2 GUIDANCE =================
-// DOWN supports all movement. Among eligible choices prefer forward,
+// DOWN is required for a forward step. Side LEDs mean turn in place and rescan. Among eligible choices prefer forward,
 // then a side. Keep the last turn when side ranges are within 15 cm.
 uint8_t Navigation::chooseDirection(uint8_t clear) {
-  if (!(clear & sensorBit(DOWN))) {
-    return HOLD;
-  }
-  if ((clear & sensorBit(CENTER)) && (clear & sensorBit(UP))) {
+  if ((clear & sensorBit(DOWN)) && (clear & sensorBit(CENTER)) && (clear & sensorBit(UP))) {
     return FORWARD;
   }
 
@@ -387,23 +428,28 @@ NavPacket Navigation::makePacket(uint32_t now) {
     if (beam[i].clear) {
       packet.clearMask |= sensorBit(i);
     }
+    if (beam[i].pathBlocked) {
+      packet.blockedMask |= sensorBit(i);
+    }
     if (beam[i].obstacle) {
       packet.obstacleMask |= sensorBit(i);
     }
   }
   lastDirection = chooseDirection(packet.clearMask);
   packet.recommendedLed = lastDirection;
-  if (!floorCm) {
-    packet.reason = CALIBRATE;
-  }
-  else if (!(packet.clearMask & sensorBit(DOWN))) {
-    packet.reason = CHECK_GROUND;
-  }
-  else if (lastDirection == HOLD) {
-    packet.reason = NO_PATH;
-  }
-  else {
+  bool frontBlocked = packet.blockedMask & (sensorBit(CENTER) | sensorBit(UP) | sensorBit(DOWN));
+  bool leftBlocked = packet.blockedMask & sensorBit(LEFT);
+  bool rightBlocked = packet.blockedMask & sensorBit(RIGHT);
+  if (lastDirection != HOLD) {
     packet.reason = PATH_FOUND;
+  } else if (frontBlocked && leftBlocked && rightBlocked) {
+    packet.reason = NO_PATH;
+  } else if (!floorCm) {
+    packet.reason = CALIBRATE;
+  } else if (!(packet.clearMask & sensorBit(DOWN))) {
+    packet.reason = CHECK_GROUND;
+  } else {
+    packet.reason = WAIT_FOR_ECHO;
   }
   return packet;
 }
@@ -473,7 +519,8 @@ void radioTask(void *) {
     }
     uint32_t now = millis();
     const NavPacket &current = latest.packet;
-    bool changed = current.clearMask != previous.clearMask ||
+    bool changed = current.blockedMask != previous.blockedMask ||
+                   current.clearMask != previous.clearMask ||
                    current.obstacleMask != previous.obstacleMask ||
                    current.recommendedLed != previous.recommendedLed ||
                    current.reason != previous.reason;
@@ -500,7 +547,7 @@ void printDebug() {
   }
   const NavPacket &packet = snapshot.packet;
   const char *choices[] = {"HOLD","FORWARD","TURN LEFT","TURN RIGHT"};
-  const char *reasons[] = {"send c on level ground","check ground","no clear path","path found"};
+  const char *reasons[] = {"send c on level ground","check ground","all paths blocked","path found","waiting for two clear echoes"};
   Serial.printf("Mode 2: %s | %s | floor %d cm\n",
                 choices[packet.recommendedLed], reasons[packet.reason], snapshot.floorCm);
   Serial.printf("LEFT zone %d cm | RIGHT zone %d cm | snapshot age %lu ms\n",
@@ -517,7 +564,9 @@ void printDebug() {
     else if (packet.obstacleMask & sensorBit(i)) {
       state = "obstacle";
     }
-    Serial.printf("%s: %d cm | %s\n", SENSOR_NAMES[i], snapshot.distances[i], state);
+    Serial.printf("%s: %d cm | %s", SENSOR_NAMES[i], snapshot.distances[i], state);
+    if (packet.blockedMask & sensorBit(i)) Serial.print(" | blocks Mode 2");
+    Serial.println("");
   }
 }
 

@@ -1,59 +1,141 @@
-# Wearable Navigation System — v1.0.0 (Prototype)
+# BeltStick — Wearable Navigation System
 
-Two ESP32-S3 N16R8 nodes communicate via ESP-NOW. The navigation node reads five HC-SR04 ultrasonic sensors (center, left, right, up, down) and one MPU6050 IMU. The interface node has two digital-output touch modules for mode selection and four directional LEDs.
+**Authors:** Ayush Mittal · Anwesha Adhikari
 
-> **Status:** Initial prototype; not hardware validated. Not a certified mobility aid. Do not rely on it for independent navigation or drop-off detection.
+An ESP32-S3-based wearable obstacle-awareness and local directional guidance prototype using five ultrasonic sensors, ESP-NOW and FreeRTOS.
 
-## Modes
-- **Mode 1 — Obstacle:** illuminate LEDs for confirmed obstacles.
-- **Mode 2 — Clear-direction:** illuminate LEDs for directions classified clear. A tentative preferred direction is also sent in the wireless packet but is not separately displayed.
+> **Prototype status:** Firmware protocol version 3. Not a certified mobility aid. The supplied archive includes mechanical prototype images but no completed quantitative validation logs. LEDs are a demonstration interface; independent use by blind users requires accessible feedback and further safety validation.
 
-| Sensor | Obstacle bit | LED |
-|---|---:|---|
-| Center | 0 | LED1 Forward |
-| Left | 1 | LED2 Left |
-| Right | 2 | LED3 Right |
-| Up | 3 | LED1 Forward |
-| Down | 4 | LED4 Down |
+## Architecture
 
-**Down LED is an awareness indicator, not a direction to walk.** Unknown readings must not be interpreted as clear.
+```mermaid
+flowchart LR
+    S[Five ultrasonic sensors] --> A[Node A: sensor task]
+    A --> Q[Ordered reading queue]
+    Q --> N[Navigation task]
+    N --> R[Radio task]
+    R -->|ESP-NOW channel 1| B[Node B: receive mailbox]
+    B --> I[Interface task]
+    T[Two touch inputs] --> I
+    I --> L[Four directional LEDs]
+```
+
+- **Node A:** Interrupt-driven echo timing, ground calibration, obstacle hysteresis, personal-space heuristic, local path selection and wireless transmission.
+- **Node B:** Packet validation, freshness checks, mode selection, nonblocking LED rendering and link-loss indication.
+- **Mechanical design:** 180 × 110 × 65 mm belt enclosure; forward sensor and four peripheral axes at 45°. Printable housing and rear cover.
+- **Final firmware:** No IMU library or IMU processing required. Older mechanical and electrical documentation may retain an unused IMU.
 
 ## Repository layout
-- `firmware/navigation_node/navigation_node.ino`: sensor processing, MPU6050, ESP-NOW
-- `firmware/interface_node/interface_node.ino`: touch selection, LEDs, ESP-NOW
-- `hardware/pinout.md`: example wiring and electrical precautions
-- `docs/V1_REPORT.md`: version 1 technical report
-- `experiments/TEST_PLAN.md`: 12 validation experiments
-- `experiments/results/`: blank result templates; replace with measurements after testing
 
-## Build and setup
-1. Use Arduino IDE with **ESP32 Arduino core 3.x**; select the appropriate ESP32-S3 board and flash/PSRAM options for your N16R8 module.
-2. Install `Adafruit MPU6050`, `Adafruit Unified Sensor`, and `Adafruit BusIO` via Library Manager.
-3. Confirm your board's pin availability and wire according to `hardware/pinout.md`.
-4. **Level-shift every HC-SR04 ECHO signal from 5 V to 3.3 V**; do not wire ECHO directly to the ESP32-S3.
-5. Upload both sketches once and read their Wi-Fi STA MAC addresses at 115200 baud.
-6. Replace `PEER_MAC` in **each** sketch with the other board's actual MAC address; reflash both. Both use ESP-NOW channel 1.
-7. Verify touch polarity. Current code expects active-LOW digital touch outputs (e.g., appropriately configured TTP223 modules).
-8. Calibrate belt height, down sensor angle, MPU6050 axis signs, and detection thresholds before meaningful trials.
+```text
+wearable-navigation-system/
+├── firmware/
+│   ├── navigation_node/navigation_node.ino
+│   └── interface_node/interface_node.ino
+├── hardware/pinout.md
+├── cad/                       # STEP, STL, FreeCAD and preview files
+├── docs/
+│   ├── circuit_diagram.png
+│   ├── circuit_diagram.pdf
+│   └── images/
+└── README.md
+```
 
-## Current algorithm
-- Sequential ultrasonic triggering (55 ms minimum between triggers), 3-sample median, EMA (alpha=0.45).
-- Obstacle enter/exit thresholds: 90/110 cm; 3 hits on left/right and 2 on others; 3 clear confirmations.
-- IMU complementary filter for pitch and roll; down sensor uses an approximate predicted floor distance.
-- ESP-NOW mode commands sent from interface node every 500 ms; navigation packets every 150 ms.
-- Interface flashes all LEDs when navigation data is stale (>750 ms) or the mode disagrees.
+## Hardware and wiring
 
-## Known limitations
-- GPIOs are examples, not verified against a specific PCB.
-- Side-arm suppression is persistence-based; it does not robustly distinguish hands from real obstacles.
-- Floor model is approximate and may hide low obstacles or fail on slopes/steps.
-- HC-SR04 cannot reliably detect every hazard or drop-off; no guarantee of path safety.
-- MPU6050 lacks a magnetometer, so there is no stable absolute heading.
-- No application-level mode acknowledgment, sequence-gap statistics, or CSV telemetry yet.
-- The code has **not been compiled or tested on hardware** for this release; timings and thresholds are hypotheses.
+Two ESP32-S3 N16R8 boards, five ultrasonic modules, two digital-output touch modules, four LEDs with resistors, appropriate power supplies and level shifting as required.
 
-## Next milestone
-Run the tests in `experiments/TEST_PLAN.md`, commit raw logs and results, then tune thresholds and document observed performance in v1.1.
+| Node A sensor | TRIG | ECHO |
+|---|---:|---:|
+| Left | 4 | 5 |
+| Center | 6 | 7 |
+| Right | 14 | 15 |
+| Up | 10 | 11 |
+| Down | 12 | 13 |
 
-## Release
-Version: `v1.0.0` · Status: prototype · Date: 2026-11-22
+| Node B component | GPIO |
+|---|---:|
+| Forward LED | 5 |
+| Left LED | 6 |
+| Right LED | 7 |
+| Down LED | 8 |
+| Mode 1 touch | 9 |
+| Mode 2 touch | 10 |
+
+**Electrical precautions:** Check the exact ultrasonic module voltage rating. Standard 5 V HC-SR04 modules need a suitable 5 V supply and ECHO level shifting to 3.3 V; never apply 5 V to an ESP32 GPIO. The firmware comments assume 3.3 V-compatible modules. Use common local ground and LED series resistors. Touch inputs are active-HIGH by default; change `TOUCH_ACTIVE_LEVEL` if necessary.
+
+![Circuit diagram](docs/circuit_diagram.png)
+
+## Build and run
+
+1. Install Arduino IDE and the ESP32 Arduino core 3.x.
+2. Select the ESP32-S3 board configuration matching the N16R8 hardware.
+3. Wire both nodes according to the tables above. No external IMU libraries are required by the final sketches.
+4. Open and upload `firmware/navigation_node/navigation_node.ino` to Node A and `firmware/interface_node/interface_node.ino` to Node B.
+5. Open both Serial Monitors at **115200 baud** (newline for Node A commands).
+6. Both nodes use ESP-NOW channel 1. Node A broadcasts by default; optionally configure `EXPECTED_NODE_A` in Node B with the belt's station MAC address to avoid accepting another transmitter. This does not provide cryptographic authentication.
+7. Wear the belt in its intended position, stand still on level ground and send `c` to Node A. Wait for eight stable DOWN echoes and successful calibration before testing forward guidance.
+8. Use touch pads or Node B serial commands `1` and `2` to select a mode. Test only in a controlled, supervised environment.
+
+## Operating modes
+
+| State | LED indication |
+|---|---|
+| Mode 1 | Obstacle LEDs blink; center or up maps to forward |
+| Mode 2 | One recommended forward, left or right LED blinks |
+| Confirmed no path (Mode 2) | Steady DOWN LED: hold position |
+| Unknown evidence or link loss | All LEDs double-flash |
+
+Mode selection has a temporary flash/chase animation, which normal hazard or uncertainty changes can interrupt. Side guidance means turn in place and rescan. An unlit LED is not a guarantee of safety.
+
+## RTOS and timing
+
+| Task | Core | Priority |
+|---|---:|---:|
+| Node A sensor acquisition | 1 | 4 |
+| Node A navigation | 1 | 3 |
+| Node A radio | 0 | 2 |
+| Node B interface | 1 | 3 |
+
+The implementation uses a binary semaphore for echo completion, ISR-safe signaling, critical sections, ordered queues, latest-value overwrite mailboxes, single-owner state and periodic scheduling using `vTaskDelayUntil()`.
+
+| Configuration | Nominal value |
+|---|---|
+| Sensor slot / full scan | 55 / 275 ms |
+| Echo timeout | 25 ms |
+| Obstacle enter / exit | Below 90 / above 110 cm |
+| Mode 2 clearance | At least 150 cm, two echoes |
+| Side personal-space band | 20 cm default; configurable 0–40 cm |
+| Measurement expiry | 450 ms |
+| Radio heartbeat / link timeout | 100 / 300 ms |
+| Interface cycle / touch debounce | 10 / 50 ms |
+
+The 26-byte packet contains protocol version, boot identifier, sequence, obstacle/clear/blocked masks, direction, reason and per-beam lifetimes. Timing values are firmware configuration, not benchmark measurements.
+
+## Serial commands
+
+| Node | Command | Action |
+|---|---|---|
+| A | `c` | Calibrate downward reference |
+| A | `s` | Print latest status |
+| A | `v` | Toggle continuous status |
+| A | `l 20` / `r 20` | Adjust left/right band in cm |
+| B | `1` / `2` | Select mode |
+| B | `s` | Show status |
+| B | `t` / `x` | Start/cancel lamp test |
+
+## Mechanical assets
+
+![CAD enclosure](docs/images/shell_cad.png)
+
+Use `cad/BeltStick_Assembly.step` for CAD assembly inspection or `cad/Housing.stl` and `cad/RearCover.stl` for printing in millimetres at 100% scale. Check transducer fit with `cad/Bore_fit_coupon.stl`; see `cad/Read_me.txt` for assembly details. Battery mounting and switch openings are not finalized.
+
+## Validation and known limitations
+
+Record measured range error, invalid-echo rate, obstacle-to-LED latency, ground calibration repeatability, path-selection results, wireless timeout/recovery, current draw and battery runtime. No results are claimed here without logs.
+
+Ultrasonic sensing can miss certain objects and cannot guarantee drop-off detection. Belt tilt can alter the floor reference, and side-band suppression may hide actual obstacles. Mode 1 obstacle persistence can overlap Mode 2 clearance, which the receiver rejects; test this interaction before deployment. Lamp testing temporarily overrides regular output. The broadcast protocol is unauthenticated, and Wi-Fi sleep is disabled. Future work includes tactile/audio feedback, electrical and mechanical qualification, power optimization and supervised accessibility testing.
+
+## Authors
+
+Ayush Mittal and Anwesha Adhikari.
